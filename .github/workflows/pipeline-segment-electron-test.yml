@@ -197,7 +197,10 @@ jobs:
         # abnormal exits and sandboxed processes the suite produces.
         echo "LLVM_PROFILE_FILE=$COVERAGE_PROFILE_DIR/electron.%4m%c.profraw" >> $GITHUB_ENV
         # Instrumented binaries run several times slower than a normal build.
+        # MOCHA_TIMEOUT only raises the suite default; specs that call
+        # this.timeout() explicitly scale themselves off IS_COVERAGE.
         echo "MOCHA_TIMEOUT=180000" >> $GITHUB_ENV
+        echo "IS_COVERAGE=true" >> $GITHUB_ENV
     # Safe to parallelize: each step writes a disjoint location (src/electron
     # node_modules, ./depot_tools, ./generated_artifacts_*, ./src_artifacts_*,
     # system CUPS state) and none reads another's output; the env/PATH changes
