@@ -105,6 +105,9 @@ Trace data will be written into `resultFilePath`. If `resultFilePath` is empty
 or not provided, trace data will be written to a temporary file, and the path
 will be returned in the promise.
 
+Recordings started with `heap_profiler_options` use the Perfetto protobuf
+format. Other recordings use the legacy JSON trace format.
+
 ### `contentTracing.getTraceBufferUsage()`
 
 <!--

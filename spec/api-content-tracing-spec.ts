@@ -9,6 +9,46 @@ import { setTimeout } from 'node:timers/promises';
 
 import { ifdescribe } from './lib/spec-helpers';
 
+const readVarint = (buffer: Buffer, initialOffset: number) => {
+  let offset = initialOffset;
+  let value = 0;
+  let shift = 0;
+  while (offset < buffer.length) {
+    const byte = buffer[offset++];
+    value += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return { value, offset };
+    shift += 7;
+  }
+  throw new Error('Truncated protobuf varint');
+};
+
+const protobufMessagesForField = (buffer: Buffer, fieldNumber: number) => {
+  const messages: Buffer[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readVarint(buffer, offset);
+    offset = tag.offset;
+    const wireType = tag.value & 0x7;
+    const currentFieldNumber = Math.floor(tag.value / 8);
+    if (wireType === 0) {
+      offset = readVarint(buffer, offset).offset;
+    } else if (wireType === 1) {
+      offset += 8;
+    } else if (wireType === 2) {
+      const length = readVarint(buffer, offset);
+      offset = length.offset;
+      const end = offset + length.value;
+      if (currentFieldNumber === fieldNumber) messages.push(buffer.subarray(offset, end));
+      offset = end;
+    } else if (wireType === 5) {
+      offset += 4;
+    } else {
+      throw new Error(`Unsupported protobuf wire type: ${wireType}`);
+    }
+  }
+  return messages;
+};
+
 // FIXME: The tests are skipped on linux arm64
 ifdescribe(process.arch !== 'arm64' || process.platform !== 'linux')('contentTracing', () => {
   const record = async (
@@ -74,6 +114,39 @@ ifdescribe(process.arch !== 'arm64' || process.platform !== 'linux')('contentTra
       // like `node,node.environment` will be included in the output.
       const content = fs.readFileSync(outputFilePath).toString();
       expect(content.includes('"cat":"node,node.environment"')).to.be.false();
+    });
+
+    it('rejects invalid heap profiler options', () => {
+      expect(() =>
+        contentTracing.startRecording({
+          heap_profiler_options: {
+            sampling_interval_bytes: -1
+          }
+        })
+      ).to.throw();
+      expect(() =>
+        contentTracing.startRecording({
+          heap_profiler_options: {
+            sampling_interval_ms: 1.5
+          }
+        })
+      ).to.throw();
+      expect(() => contentTracing.startRecording({ heap_profiler_options: 'invalid' } as any)).to.throw();
+      expect(() =>
+        contentTracing.startRecording({
+          heap_profiler_options: {
+            sampling_interval_bytes: Number.MAX_SAFE_INTEGER + 1
+          }
+        })
+      ).to.throw();
+    });
+
+    it('rejects a second stop while heap tracing is stopping', async () => {
+      await contentTracing.startRecording({ heap_profiler_options: {} });
+
+      const firstStop = contentTracing.stopRecording();
+      await expect(contentTracing.stopRecording()).to.eventually.be.rejectedWith('trace is already stopping');
+      await firstStop;
     });
 
     it('accepts "categoryFilter" and "traceOptions" as a config', async () => {
@@ -172,9 +245,44 @@ ifdescribe(process.arch !== 'arm64' || process.platform !== 'linux')('contentTra
       expect(result).to.have.property('percentage').that.is.a('number');
       expect(result.percentage).to.equal(0);
     });
+
+    it('settles concurrent requests during heap profiling', async () => {
+      await app.whenReady();
+      await contentTracing.startRecording({ heap_profiler_options: {} });
+
+      const results = await Promise.all([contentTracing.getTraceBufferUsage(), contentTracing.getTraceBufferUsage()]);
+      for (const result of results) {
+        expect(result).to.have.property('percentage').that.is.a('number');
+        expect(result).to.have.property('value').that.is.a('number');
+      }
+
+      await contentTracing.stopRecording();
+    });
   });
 
   describe('captured events', () => {
+    it('include native heap profiler stack samples', async function () {
+      this.timeout(60000);
+      await app.whenReady();
+      await contentTracing.startRecording({
+        heap_profiler_options: {
+          sampling_interval_bytes: 1024,
+          sampling_interval_ms: 10
+        }
+      });
+
+      const allocations: Buffer[] = [];
+      for (let index = 0; index < 1000; index++) {
+        allocations.push(Buffer.alloc(4096));
+      }
+      await setTimeout(100);
+
+      await contentTracing.stopRecording(outputFilePath);
+      const trace = fs.readFileSync(outputFilePath);
+      const tracePackets = protobufMessagesForField(trace, 1);
+      expect(tracePackets.some((packet) => protobufMessagesForField(packet, 135).length > 0)).to.be.true();
+    });
+
     it('include V8 samples from the main process', async function () {
       this.timeout(60000);
       await contentTracing.startRecording({
